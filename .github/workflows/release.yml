@@ -1,0 +1,73 @@
+name: Release and Code Sign
+
+on:
+  push:
+    tags:
+      - 'v*' # v1.0.0 のようなタグがプッシュされたときに動作
+
+jobs:
+  build-and-sign:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # リリースを作成するために必要
+
+    steps:
+      # 1. ソースコードの取得
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # 2. Go の環境セットアップ
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: 'go.mod'
+
+      # 3. Windows向け実行ファイルのビルド (管理者権限不要でGUIを非表示にする設定)
+      - name: Build binary
+        env:
+          GOOS: windows
+          GOARCH: amd64
+        run: |
+          go build -ldflags="-s -w -H windowsgui" -o sr-changer.exe main.go
+
+      # 4. 未署名の実行ファイルを一時的にアップロード (SignPathの処理用)
+      - name: Upload unsigned binary for signing
+        id: upload-unsigned
+        uses: actions/upload-artifact@v4
+        with:
+          name: unsigned-binary
+          path: sr-changer.exe
+          retention-days: 1
+
+      # 5. SignPathへの署名リクエスト送信
+      # 事前にGitHubリポジトリの Settings > Secrets and variables > Actions で以下のシークレットを設定しておきます。
+      - name: Submit signing request to SignPath
+        uses: signpath/github-action-submit-signing-request@v2
+        with:
+          api-token: '${{ secrets.SIGNPATH_API_TOKEN }}'
+          organization-id: '${{ secrets.SIGNPATH_ORGANIZATION_ID }}'
+          project-slug: '${{ secrets.SIGNPATH_PROJECT_SLUG }}'
+          signing-policy-slug: '${{ secrets.SIGNPATH_SIGNING_POLICY_SLUG }}'
+          github-artifact-id: '${{ steps.upload-unsigned.outputs.artifact-id }}'
+          wait-for-completion: true
+          output-artifact-directory: 'signed-output'
+
+      # 6. 署名されたファイルの確認と名前の調整
+      - name: Prepare release files
+        run: |
+          mkdir -p dist
+          # SignPathからダウンロードされたファイルを取り出して配置します
+          cp signed-output/sr-changer.exe dist/sr-changer.exe
+          # 配布用にZIP圧縮したものも作成します
+          zip -j dist/sr-changer.zip dist/sr-changer.exe README.md LICENSE
+
+      # 7. GitHub Release の自動作成とファイルのアップロード
+      - name: Create GitHub Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create ${{ github.ref_name }} \
+            --title "Release ${{ github.ref_name }}" \
+            --generate-notes \
+            dist/sr-changer.exe \
+            dist/sr-changer.zip
