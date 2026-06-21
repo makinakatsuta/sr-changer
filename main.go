@@ -12,7 +12,11 @@ import (
 	"syscall"
 	"time"
 	"unicode/utf16"
+	"unsafe"
 )
+
+const PROCESS_TERMINATE = 0x0001
+
 
 const (
 	NvdaExeName     = "nvda.exe"
@@ -181,6 +185,7 @@ func showError(msg string) {
 [System.Windows.Forms.MessageBox]::Show('%s', 'エラー', 'OK', 'Error') | Out-Null`, escaped)
 	newGuiCmd("powershell",
 		"-NoProfile",
+		"-ExecutionPolicy", "Bypass",
 		"-EncodedCommand", encodePSCommand(script),
 	).Run()
 }
@@ -275,14 +280,29 @@ $form.Controls.Add($rb%d)
 	}
 
 	btnY := startY + len(readers)*rowHeight + 15
-	cancelX := (formWidth - btnWidth - 16) / 2 // クライアント中央付近（Windowsのボーダーを考慮して調整）
+	totalButtonsWidth := btnWidth + 20 + btnWidth // 260
+	okX := (formWidth - 16 - totalButtonsWidth) / 2
+	cancelX := okX + btnWidth + 20
 
 	sb.WriteString(fmt.Sprintf(`$okBtn = New-Object System.Windows.Forms.Button
 $okBtn.Text = "起動"
-$okBtn.Size = New-Object System.Drawing.Size(1, 1)
-$okBtn.Location = New-Object System.Drawing.Point(-100, -100)
-$okBtn.TabStop = $false
+$okBtn.Size = New-Object System.Drawing.Size(%d, %d)
+$okBtn.Location = New-Object System.Drawing.Point(%d, %d)
+$okBtn.Font = $btnFont
+$okBtn.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+$okBtn.BackColor = [System.Drawing.Color]::FromArgb(50, 50, 50)
+$okBtn.ForeColor = [System.Drawing.Color]::FromArgb(240, 240, 240)
+$okBtn.FlatAppearance.BorderSize = 2
+$okBtn.FlatAppearance.BorderColor = [System.Drawing.Color]::FromArgb(100, 100, 100)
 $okBtn.DialogResult = [System.Windows.Forms.DialogResult]::OK
+$okBtn.Add_GotFocus({
+	$this.BackColor = [System.Drawing.Color]::FromArgb(70, 70, 70)
+	$this.FlatAppearance.BorderColor = [System.Drawing.Color]::Gold
+})
+$okBtn.Add_LostFocus({
+	$this.BackColor = [System.Drawing.Color]::FromArgb(50, 50, 50)
+	$this.FlatAppearance.BorderColor = [System.Drawing.Color]::FromArgb(100, 100, 100)
+})
 $form.Controls.Add($okBtn)
 $form.AcceptButton = $okBtn
 
@@ -314,7 +334,7 @@ $form.Add_Shown({
 })
 [void]$form.ShowDialog()
 if ($form.DialogResult -eq [System.Windows.Forms.DialogResult]::OK) {
-`, btnWidth, btnHeight, cancelX, btnY, defaultIdx))
+`, btnWidth, btnHeight, okX, btnY, btnWidth, btnHeight, cancelX, btnY, defaultIdx))
 
 	for i, r := range readers {
 		sb.WriteString(fmt.Sprintf("  if ($rb%d.Checked) { Write-Output '%s' }\n", i, r.ID))
@@ -323,6 +343,7 @@ if ($form.DialogResult -eq [System.Windows.Forms.DialogResult]::OK) {
 
 	cmd := newGuiCmd("powershell",
 		"-NoProfile",
+		"-ExecutionPolicy", "Bypass",
 		"-EncodedCommand", encodePSCommand(sb.String()),
 	)
 	out, err := cmd.Output()
@@ -334,6 +355,25 @@ if ($form.DialogResult -eq [System.Windows.Forms.DialogResult]::OK) {
 		return ""
 	}
 	return result
+}
+
+// stopScreenReader は指定されたスクリーンリーダーのプロセスを停止します。
+// NVDAの場合はまずクリーン終了を試み、停止しない場合に強制終了します。
+func stopScreenReader(exe string, timeout time.Duration, readers []Reader) {
+	if !isRunning(exe) {
+		return
+	}
+	if strings.EqualFold(exe, NvdaExeName) {
+		cleanQuitNvda(readers)
+		// クリーン終了を少し待つ
+		time.Sleep(500 * time.Millisecond)
+		if isRunning(exe) {
+			killProcess(exe)
+		}
+	} else {
+		killProcess(exe)
+	}
+	waitForExit(exe, timeout)
 }
 
 // trySwitchWithoutAdmin は管理者権限（UAC）を要求せずにスクリーンリーダーの切り替えを試みます。
@@ -369,19 +409,7 @@ func trySwitchWithoutAdmin(targetID string, cfg Config, readers []Reader) bool {
 	// 起動中のスクリーンリーダーをすべて停止（対象以外）
 	for _, exe := range []string{NvdaExeName, NarratorExeName, PcTalkerExeName} {
 		if !strings.EqualFold(exe, target.ExeName) && isRunning(exe) {
-			if strings.EqualFold(exe, NvdaExeName) {
-				// NVDAの場合はクリーン終了コマンドを実行
-				cleanQuitNvda(readers)
-				// クリーン終了を少し待つ
-				time.Sleep(500 * time.Millisecond)
-				if isRunning(exe) {
-					// まだ動いている場合は強制終了を試みる
-					killProcess(exe)
-				}
-			} else {
-				killProcess(exe)
-			}
-			waitForExit(exe, timeout)
+			stopScreenReader(exe, timeout, readers)
 		}
 	}
 
@@ -493,8 +521,7 @@ func runAdmin(targetID string, cfg Config, readers []Reader) {
 	// 起動中のスクリーンリーダーをすべて停止（対象以外）
 	for _, exe := range []string{NvdaExeName, NarratorExeName, PcTalkerExeName} {
 		if !strings.EqualFold(exe, target.ExeName) && isRunning(exe) {
-			killProcess(exe)
-			waitForExit(exe, timeout)
+			stopScreenReader(exe, timeout, readers)
 		}
 	}
 
@@ -540,7 +567,7 @@ func main() {
 // waitForExit は指定したプロセスが終了するまで最大 timeout 待ちます
 func waitForExit(name string, timeout time.Duration) {
 	deadline := time.After(timeout)
-	ticker := time.NewTicker(500 * time.Millisecond)
+	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
 	for {
 		select {
@@ -618,7 +645,7 @@ func runElevated(readerID string) error {
 	tempExeEscaped := strings.ReplaceAll(tempExePath, "'", "''")
 	// 管理者権限で起動し、その終了を待機する (-Wait オプションを追加)
 	script := fmt.Sprintf("Start-Process '%s' -ArgumentList @('-reader','%s') -Verb RunAs -Wait", tempExeEscaped, readerID)
-	out, err := newHiddenCmd("powershell", "-NoProfile", "-Command", script).CombinedOutput()
+	out, err := newHiddenCmd("powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script).CombinedOutput()
 	if err != nil {
 		msg := strings.ToLower(string(out))
 		// UAC拒否はユーザーの正常なキャンセル操作なのでエラー扱いしない
@@ -634,11 +661,39 @@ func runElevated(readerID string) error {
 }
 
 func isRunning(name string) bool {
-	out, err := newHiddenCmd("tasklist", "/FI", "IMAGENAME eq "+name).Output()
+	h, err := syscall.CreateToolhelp32Snapshot(syscall.TH32CS_SNAPPROCESS, 0)
 	if err != nil {
 		return false
 	}
-	return strings.Contains(strings.ToLower(string(out)), strings.ToLower(name))
+	defer syscall.CloseHandle(h)
+
+	var pe syscall.ProcessEntry32
+	pe.Size = uint32(unsafe.Sizeof(pe))
+
+	err = syscall.Process32First(h, &pe)
+	if err != nil {
+		return false
+	}
+
+	target := strings.ToLower(name)
+	for {
+		var end int
+		for end = 0; end < len(pe.ExeFile); end++ {
+			if pe.ExeFile[end] == 0 {
+				break
+			}
+		}
+		exeName := string(utf16.Decode(pe.ExeFile[:end]))
+		if strings.EqualFold(exeName, target) {
+			return true
+		}
+
+		err = syscall.Process32Next(h, &pe)
+		if err != nil {
+			break
+		}
+	}
+	return false
 }
 
 func startProcess(path string) error {
@@ -646,7 +701,42 @@ func startProcess(path string) error {
 }
 
 func killProcess(name string) {
-	newHiddenCmd("taskkill", "/IM", name, "/F").Run()
+	h, err := syscall.CreateToolhelp32Snapshot(syscall.TH32CS_SNAPPROCESS, 0)
+	if err != nil {
+		return
+	}
+	defer syscall.CloseHandle(h)
+
+	var pe syscall.ProcessEntry32
+	pe.Size = uint32(unsafe.Sizeof(pe))
+
+	err = syscall.Process32First(h, &pe)
+	if err != nil {
+		return
+	}
+
+	target := strings.ToLower(name)
+	for {
+		var end int
+		for end = 0; end < len(pe.ExeFile); end++ {
+			if pe.ExeFile[end] == 0 {
+				break
+			}
+		}
+		exeName := string(utf16.Decode(pe.ExeFile[:end]))
+		if strings.EqualFold(exeName, target) {
+			ph, err := syscall.OpenProcess(PROCESS_TERMINATE, false, pe.ProcessID)
+			if err == nil {
+				_ = syscall.TerminateProcess(ph, 1)
+				syscall.CloseHandle(ph)
+			}
+		}
+
+		err = syscall.Process32Next(h, &pe)
+		if err != nil {
+			break
+		}
+	}
 }
 
 var (
