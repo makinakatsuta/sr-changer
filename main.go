@@ -282,7 +282,7 @@ $rb%d.Add_LostFocus({
 })
 $form.Controls.Add($rb%d)
 $rbs += $rb%d
-`, i, i, label, i, i, i, yPos, i, i, checked, i, i, i, i, i, i, i, i, i))
+`, i, i, label, i, i, i, yPos, i, i, checked, i, i, i, i, i, i, i, i))
 	}
 
 	sb.WriteString(fmt.Sprintf(`
