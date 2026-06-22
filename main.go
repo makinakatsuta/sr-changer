@@ -215,7 +215,9 @@ func showSelectionDialog(readers []Reader, defaultID string) string {
 	btnHeight := 36
 	btnWidth := 120
 
-	formHeight := startY + len(readers)*rowHeight + btnHeight + 70
+	helpY := startY + len(readers)*rowHeight + 5
+	btnY := helpY + 30
+	formHeight := btnY + btnHeight + 60
 	var sb strings.Builder
 
 	sb.WriteString(fmt.Sprintf(`Add-Type -AssemblyName System.Windows.Forms
@@ -233,6 +235,7 @@ $form.BackColor = [System.Drawing.Color]::FromArgb(26, 26, 26)
 $titleFont = New-Object System.Drawing.Font("Yu Gothic UI", 12, [System.Drawing.FontStyle]::Bold)
 $rbFont = New-Object System.Drawing.Font("Yu Gothic UI", 12, [System.Drawing.FontStyle]::Bold)
 $btnFont = New-Object System.Drawing.Font("Yu Gothic UI", 11, [System.Drawing.FontStyle]::Bold)
+$helpFont = New-Object System.Drawing.Font("Yu Gothic UI", 9.5, [System.Drawing.FontStyle]::Regular)
 
 $label = New-Object System.Windows.Forms.Label
 $label.Text = "起動するスクリーンリーダーを選択してください:"
@@ -242,10 +245,12 @@ $label.Location = New-Object System.Drawing.Point(20, 20)
 $label.Font = $titleFont
 $label.ForeColor = [System.Drawing.Color]::FromArgb(240, 240, 240)
 $form.Controls.Add($label)
+
+$rbs = @()
 `, formWidth, formHeight))
 
 	for i, r := range readers {
-		label := r.DisplayName
+		label := fmt.Sprintf("%d. %s", i+1, r.DisplayName)
 		if isRunning(r.ExeName) {
 			label += "  （現在起動中）"
 		}
@@ -276,12 +281,22 @@ $rb%d.Add_LostFocus({
 	$this.ForeColor = [System.Drawing.Color]::FromArgb(220, 220, 220)
 })
 $form.Controls.Add($rb%d)
-`, i, i, label, i, i, i, yPos, i, i, checked, i, i, i, i, i, i, i))
+$rbs += $rb%d
+`, i, i, label, i, i, i, yPos, i, i, checked, i, i, i, i, i, i, i, i, i))
 	}
 
-	btnY := startY + len(readers)*rowHeight + 15
-	totalButtonsWidth := btnWidth + 20 + btnWidth // 260
-	okX := (formWidth - 16 - totalButtonsWidth) / 2
+	sb.WriteString(fmt.Sprintf(`
+$helpLabel = New-Object System.Windows.Forms.Label
+$helpLabel.Text = "※数字キー（1～%d）で選択、Enterキーで起動できます。"
+$helpLabel.AutoSize = $false
+$helpLabel.Size = New-Object System.Drawing.Size(410, 20)
+$helpLabel.Location = New-Object System.Drawing.Point(25, %d)
+$helpLabel.Font = $helpFont
+$helpLabel.ForeColor = [System.Drawing.Color]::FromArgb(180, 180, 180)
+$form.Controls.Add($helpLabel)
+`, len(readers), helpY))
+
+	okX := (formWidth - 16 - (btnWidth + 20 + btnWidth)) / 2
 	cancelX := okX + btnWidth + 20
 
 	sb.WriteString(fmt.Sprintf(`$okBtn = New-Object System.Windows.Forms.Button
@@ -327,6 +342,21 @@ $cancelBtn.Add_LostFocus({
 })
 $form.Controls.Add($cancelBtn)
 $form.CancelButton = $cancelBtn
+
+$form.KeyPreview = $true
+$form.Add_KeyDown({
+	param($sender, $e)
+	$val = -1
+	if ($e.KeyCode -ge [System.Windows.Forms.Keys]::D1 -and $e.KeyCode -le [System.Windows.Forms.Keys]::D9) {
+		$val = [int]$e.KeyCode - [int][System.Windows.Forms.Keys]::D1
+	} elseif ($e.KeyCode -ge [System.Windows.Forms.Keys]::NumPad1 -and $e.KeyCode -le [System.Windows.Forms.Keys]::NumPad9) {
+		$val = [int]$e.KeyCode - [int][System.Windows.Forms.Keys]::NumPad1
+	}
+	if ($val -ge 0 -and $val -lt $rbs.Count) {
+		$rbs[$val].Checked = $true
+		$rbs[$val].Focus()
+	}
+})
 
 $form.Add_Shown({
 	$form.Activate()
@@ -400,6 +430,9 @@ func trySwitchWithoutAdmin(targetID string, cfg Config, readers []Reader) bool {
 	if target == nil {
 		return false
 	}
+
+	// 切り替え開始音声案内 (無音時間中のガイダンス)
+	speakText(fmt.Sprintf("%sを起動します。", target.DisplayName))
 
 	// 切り替え開始音 (ピッ: 880Hz, 150ms)
 	playBeep(880, 150)
@@ -512,6 +545,9 @@ func runAdmin(targetID string, cfg Config, readers []Reader) {
 		return
 	}
 
+	// 切り替え開始音声案内 (無音時間中のガイダンス)
+	speakText(fmt.Sprintf("%sを起動します。", target.DisplayName))
+
 	// 切り替え開始音 (ピッ: 880Hz, 150ms)
 	// これにより全盲のユーザーは管理者権限での実行が開始されたことを認識できます
 	playBeep(880, 150)
@@ -538,12 +574,6 @@ func runAdmin(targetID string, cfg Config, readers []Reader) {
 }
 
 func main() {
-	// --- 非管理者: ダイアログ表示 → UAC昇格 ---
-	if !isAdmin() {
-		runNonAdmin()
-		return
-	}
-
 	// --- 管理者権限あり: 引数から対象を取得して切り替え実行 ---
 	targetID := ""
 	args := os.Args[1:]
@@ -552,6 +582,19 @@ func main() {
 			targetID = args[i+1]
 			break
 		}
+	}
+
+	// 引数なしで起動された（＝ダイアログを表示する）場合のみ、多重起動を防止する
+	if targetID == "" {
+		if !checkSingleInstance() {
+			return // 既に起動中なら静かに終了
+		}
+	}
+
+	// --- 非管理者: ダイアログ表示 → UAC昇格 ---
+	if !isAdmin() {
+		runNonAdmin()
+		return
 	}
 
 	cfg := loadConfig()
@@ -739,10 +782,44 @@ func killProcess(name string) {
 	}
 }
 
+var mutexHandle uintptr
+
 var (
-	modkernel32 = syscall.NewLazyDLL("kernel32.dll")
-	procBeep    = modkernel32.NewProc("Beep")
+	modkernel32      = syscall.NewLazyDLL("kernel32.dll")
+	procBeep         = modkernel32.NewProc("Beep")
+	procCreateMutexW = modkernel32.NewProc("CreateMutexW")
 )
+
+// checkSingleInstance は多重起動を防止するためにミューテックスを作成します。
+// 既に起動している場合は false を返します。
+func checkSingleInstance() bool {
+	mutexName := "Global\\SRChangerGUI-Mutex-9f3a2b1c"
+	namePtr, err := syscall.UTF16PtrFromString(mutexName)
+	if err != nil {
+		return true // エラー時は安全のため続行
+	}
+	ret, _, err := procCreateMutexW.Call(0, 1, uintptr(unsafe.Pointer(namePtr)))
+	if ret == 0 {
+		return true
+	}
+	if err != nil && err.(syscall.Errno) == 183 { // ERROR_ALREADY_EXISTS
+		return false
+	}
+	mutexHandle = ret
+	return true
+}
+
+// speakText は Windows 標準の Speech API (SAPI) を非同期で呼び出し、
+// スクリーンリーダー切り替え中の無音時間でも音声ガイダンスを提供します。
+func speakText(text string) {
+	escaped := strings.ReplaceAll(text, "'", "''")
+	script := fmt.Sprintf(`(New-Object -ComObject SAPI.SpVoice).Speak('%s', 1)`, escaped)
+	_ = newHiddenCmd("powershell",
+		"-NoProfile",
+		"-ExecutionPolicy", "Bypass",
+		"-EncodedCommand", encodePSCommand(script),
+	).Start()
+}
 
 // playBeep は Windows API の Beep を呼び出して指定周波数・長さのビープ音を鳴らします。
 func playBeep(freq, duration uint32) {
